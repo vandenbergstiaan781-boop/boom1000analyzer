@@ -1,0 +1,5 @@
+numpy>=1.24
+streamlit>=1.66
+plotly>=5.20
+websocket-client>=1.6
+pytest>=7.0

@@ -28,6 +28,20 @@ VERDICT_STYLE = {
     me.WAIT: ("⏳", MUTED),
 }
 
+# Compact dashboard styling: tighter spacing, smaller metric text, card headers.
+DASHBOARD_CSS = """
+<style>
+.block-container {padding-top: 2.6rem; padding-bottom: 1rem;}
+[data-testid="stMetricValue"] {font-size: 1.3rem;}
+[data-testid="stMetricLabel"] p {font-size: 0.78rem; color: #898781;}
+.dash-head {display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 0.2rem;}
+.dash-head h1 {font-size: 1.6rem; margin: 0; padding: 0;}
+.dash-pill {display: inline-block; font-size: 0.8rem; font-weight: 600; padding: 3px 10px;
+            border-radius: 999px; margin-left: 10px; vertical-align: middle;}
+.dash-badge {font-size: 0.78rem; color: #898781; border: 1px solid #383835; border-radius: 999px; padding: 2px 10px;}
+</style>
+"""
+
 TIMEFRAMES = {"Ticks": 0, "M1": 60, "M5": 300, "M15": 900}
 SOURCES = ("Simulated", "Deriv live (no key)", "CSV upload")
 
@@ -599,13 +613,17 @@ def show_alert(probability: float) -> None:
 
 
 def show_downtrend(downtrend: dict) -> None:
-    """Red warning when past bars confirm a prolonged grind, plus the checks behind it."""
+    """Red warning when past bars confirm a prolonged grind."""
     if downtrend["detected"]:
         st.error(
             "**⚠️ EXTENDED DOWN-TREND DETECTED**\n\n"
             "Past and current data show a prolonged downward grind. "
             "Do not assume a spike is due just because the wait is long."
         )
+
+
+def downtrend_checks(downtrend: dict) -> None:
+    """Expander with the readings behind the down-trend warning."""
     if downtrend["checks"]:
         label = "Extended down-trend checks" + (" (detected)" if downtrend["detected"] else "")
         with st.expander(f"{label}: last {downtrend['lookback']} bars"):
@@ -613,111 +631,139 @@ def show_downtrend(downtrend: dict) -> None:
             st.caption("Detected when every Required check passes and at least 2 of the 3 trend patterns show.")
 
 
-def show_exhaustion(exhaustion: dict, downtrend: dict, probability: float) -> None:
-    """Exhaustion bar and score context tag, shown below the down-trend banner."""
-    tag = score_context_tag(downtrend["detected"], probability)
+def show_context_tag(downtrend_detected: bool, probability: float) -> None:
+    """Trap vs Clean Setup tag for the master score."""
+    tag = score_context_tag(downtrend_detected, probability)
     if tag == "trap":
         st.error("⚠️ High-Risk Grind Trap — Avoid")
     elif tag == "clean":
         st.success("✅ Clean Setup Zone — No Heavy Down-Trend")
 
-    if not exhaustion["ready"]:
-        st.caption("Down-Trend Exhaustion: waiting for enough bars and a warm 20 EMA.")
-        return
-    score = exhaustion["score"]
-    icon = "🟢" if score >= EXHAUSTION_ZONE else ("🟡" if score >= SLOWING_ZONE else "🔴")
-    st.progress(
-        min(max(int(round(score)), 0), 100),
-        text=f"Down-Trend Exhaustion: {score:.0f}% · {icon} {exhaustion_status(score)}",
+
+def big_number(kicker: str, value: str, pill: str = "", colour: str = MUTED) -> None:
+    """Card header: small label, large value and an optional coloured status pill."""
+    pill_html = (
+        f'<span class="dash-pill" style="color:{colour};background:{colour}22;'
+        f'border:1px solid {colour}66">{html.escape(pill)}</span>'
+        if pill else ""
     )
-    with st.expander("How the exhaustion score was built"):
-        names = {
-            "deceleration": "Grind deceleration",
-            "shrinking": "Shrinking candles",
-            "convergence": "EMA convergence",
-            "stretch": "Historical stretch",
-        }
-        st.dataframe(
-            [
-                {"Factor": names[k], "Reading": exhaustion["readings"][k],
-                 "Points": f"{exhaustion['points'][k]:.1f} / {EXHAUSTION_POINTS[k]:.0f}"}
-                for k in EXHAUSTION_POINTS
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-        st.caption("Compares the earlier and later half of the down-trend lookback. Weighted score, not a measured chance.")
+    st.markdown(
+        f'<div style="font-size:0.72rem;letter-spacing:0.08em;text-transform:uppercase;color:{MUTED}">'
+        f'{html.escape(kicker)}</div>'
+        f'<div style="font-size:2.4rem;font-weight:700;line-height:1.15;margin:2px 0 6px">'
+        f'{html.escape(value)}{pill_html}</div>',
+        unsafe_allow_html=True,
+    )
 
 
-def master_panel(
-    cycle: dict, reading: dict, master: dict, source_text: str, downtrend: dict, exhaustion: dict
-) -> None:
-    """Alert banners, cycle and probability cards, tension bar and factor breakdown."""
-    st.caption(source_text)
-    probability = float(master["probability"])
-    tension = float(master["tension"])
-    show_alert(probability)
-    show_downtrend(downtrend)
-    show_exhaustion(exhaustion, downtrend, probability)
+def exhaustion_colour(score: float) -> str:
+    if score >= EXHAUSTION_ZONE:
+        return "#0ca30c"
+    return "#fab219" if score >= SLOWING_ZONE else "#e5484d"
 
-    has_age = np.isfinite(cycle["ticks"])
+
+def exhaustion_card(exhaustion: dict, downtrend: dict) -> None:
+    """Command center, right column: exhaustion bar, percentage and status."""
+    with st.container(border=True):
+        if not exhaustion["ready"]:
+            big_number("Down-Trend Exhaustion", "n/a")
+            st.caption("Waiting for enough bars and a warm 20 EMA.")
+            downtrend_checks(downtrend)
+            return
+
+        score = exhaustion["score"]
+        icon = "🟢" if score >= EXHAUSTION_ZONE else ("🟡" if score >= SLOWING_ZONE else "🔴")
+        big_number("Down-Trend Exhaustion", f"{score:.0f}%")
+        st.progress(min(max(int(round(score)), 0), 100), text=f"{icon} {exhaustion_status(score)}")
+
+        with st.expander("How the exhaustion score was built"):
+            names = {
+                "deceleration": "Grind deceleration",
+                "shrinking": "Shrinking candles",
+                "convergence": "EMA convergence",
+                "stretch": "Historical stretch",
+            }
+            st.dataframe(
+                [
+                    {"Factor": names[k], "Reading": exhaustion["readings"][k],
+                     "Points": f"{exhaustion['points'][k]:.1f} / {EXHAUSTION_POINTS[k]:.0f}"}
+                    for k in EXHAUSTION_POINTS
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+            st.caption("Compares the earlier and later half of the down-trend lookback. Weighted score, not a measured chance.")
+        downtrend_checks(downtrend)
+
+
+def cycle_texts(cycle: dict) -> tuple[str, str]:
+    """Cycle age as (ticks, seconds) text, with ~ for estimates and + for 'at least'."""
+    if not np.isfinite(cycle["ticks"]):
+        return "n/a", "n/a"
     suffix = "" if cycle["known"] else "+"  # no spike seen yet, so the true age is at least this
     prefix = "~" if cycle["estimated"] else ""
-    ticks_text = f"{prefix}{cycle['ticks']:,.0f}{suffix}" if has_age else "n/a"
-    seconds_text = f"{prefix}{cycle['ticks'] * SECONDS_PER_TICK:,.0f}{suffix} s" if has_age else "n/a"
-
-    cols = st.columns(3)
-    cols[0].metric("Cycle Age (Ticks)", ticks_text)
-    cols[1].metric("Cycle Age (Seconds)", seconds_text)
-    cols[2].metric("Master Spike Probability", f"{probability:.1f}%")
-
-    st.progress(min(max(int(round(tension)), 0), 100), text=f"Spring Tension Level: {tension:.0f}/100")
-
-    state = st.session_state
-    if cycle["estimated"]:
-        st.caption("This CSV has candles, so cycle age and density are estimates. Upload a tick export for exact counts.")
-    else:
-        st.caption(
-            f"{state.total_ticks_recorded:,} ticks recorded · {state.spikes_recorded:,} spikes · "
-            f"biggest uptick not counted as a spike: {state.largest_small_up:.2f}"
-        )
-    st.caption("Weighted score, not a measured chance of a spike. The Edge test tab compares it to what actually happened.")
-
-    with st.expander("How this score was built"):
-        points = master["points"]
-        density_text = "n/a" if not np.isfinite(cycle["density"]) else f"{cycle['density']:.0f}%"
-        st.dataframe(
-            [
-                {"Factor": "Cycle age", "Reading": ticks_text, "Maxes out at": "1,000 ticks",
-                 "Points": f"{float(points['cycle']):.1f} / 35"},
-                {"Factor": "ATR pullback", "Reading": reading["pullback"], "Maxes out at": "25 ATR",
-                 "Points": f"{float(points['pullback']):.1f} / 30"},
-                {"Factor": "EMA deviation", "Reading": reading["ema"], "Maxes out at": reading["ema_extreme"],
-                 "Points": f"{float(points['ema']):.1f} / 20"},
-                {"Factor": "Down-bar density", "Reading": density_text, "Maxes out at": "100%",
-                 "Points": f"{float(points['density']):.1f} / 15"},
-            ],
-            width="stretch",
-            hide_index=True,
-        )
+    return (
+        f"{prefix}{cycle['ticks']:,.0f}{suffix}",
+        f"{prefix}{cycle['ticks'] * SECONDS_PER_TICK:,.0f}{suffix} s",
+    )
 
 
-def verdict_card(snapshot: dict, source_text: str) -> None:
+def master_card(cycle: dict, reading: dict, master: dict, downtrend: dict) -> None:
+    """Command center, left column: master score, alert, context tag and cycle stats."""
+    probability = float(master["probability"])
+    tension = float(master["tension"])
+    ticks_text, seconds_text = cycle_texts(cycle)
+
+    with st.container(border=True):
+        big_number("Master Spike Probability", f"{probability:.1f}%")
+        show_alert(probability)
+        show_context_tag(downtrend["detected"], probability)
+        st.progress(min(max(int(round(tension)), 0), 100), text=f"Spring Tension Level: {tension:.0f}/100")
+
+        cols = st.columns(2)
+        cols[0].metric("Cycle Age (Ticks)", ticks_text)
+        cols[1].metric("Cycle Age (Seconds)", seconds_text)
+
+        state = st.session_state
+        if cycle["estimated"]:
+            st.caption("Candle CSV: cycle age and density are estimates. Upload a tick export for exact counts.")
+        else:
+            st.caption(
+                f"{state.total_ticks_recorded:,} ticks · {state.spikes_recorded:,} spikes · "
+                f"biggest uptick not counted as a spike: {state.largest_small_up:.2f}"
+            )
+
+        with st.expander("How this score was built"):
+            points = master["points"]
+            density_text = "n/a" if not np.isfinite(cycle["density"]) else f"{cycle['density']:.0f}%"
+            st.dataframe(
+                [
+                    {"Factor": "Cycle age", "Reading": ticks_text, "Maxes out at": "1,000 ticks",
+                     "Points": f"{float(points['cycle']):.1f} / 35"},
+                    {"Factor": "ATR pullback", "Reading": reading["pullback"], "Maxes out at": "25 ATR",
+                     "Points": f"{float(points['pullback']):.1f} / 30"},
+                    {"Factor": "EMA deviation", "Reading": reading["ema"], "Maxes out at": reading["ema_extreme"],
+                     "Points": f"{float(points['ema']):.1f} / 20"},
+                    {"Factor": "Down-bar density", "Reading": density_text, "Maxes out at": "100%",
+                     "Points": f"{float(points['density']):.1f} / 15"},
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+            st.caption("Weighted score, not a measured chance of a spike. The Edge test tab compares it to what actually happened.")
+
+
+def verdict_card(snapshot: dict) -> None:
+    """Compact bar score verdict for the stats strip."""
     icon, colour = VERDICT_STYLE[snapshot["verdict_code"]]
-    if snapshot["ready"]:
-        note = "Label comes from the score. It is not a measured probability: check the Edge test tab."
-    else:
-        note = "Still warming up: needs enough bars and at least 5 completed spike cycles."
+    note = "Score label, not a probability" if snapshot["ready"] else "Warming up: needs 5 spike cycles"
     st.markdown(
         f"""
-        <div style="border-left:6px solid {colour};background:{SURFACE};border-radius:8px;
-                    padding:14px 20px;margin-bottom:12px">
-          <div style="font-size:0.85rem;color:{MUTED}">Bar score · {html.escape(source_text)}</div>
-          <div style="font-size:1.9rem;font-weight:700;line-height:1.3">
-            {icon} {html.escape(snapshot["verdict"])}
-            <span style="font-weight:400;color:{INK}">· {snapshot["score"]:.0f}/100</span>
-          </div>
-          <div style="font-size:0.85rem;color:{INK}">{note}</div>
+        <div style="border-left:4px solid {colour};padding:2px 0 2px 12px">
+          <div style="font-size:0.72rem;letter-spacing:0.08em;text-transform:uppercase;color:{MUTED}">Bar score</div>
+          <div style="font-size:1.1rem;font-weight:700;line-height:1.35">{icon} {html.escape(snapshot["verdict"])}</div>
+          <div style="font-size:0.85rem;color:{INK}">{snapshot["score"]:.0f}/100</div>
+          <div style="font-size:0.75rem;color:{MUTED}">{note}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -728,22 +774,25 @@ def fmt(value, spec: str = ",.2f", suffix: str = "") -> str:
     return "n/a" if value is None else f"{value:{spec}}{suffix}"
 
 
-def metric_row(s: dict) -> None:
-    cols = st.columns(5)
-    cols[0].metric("Price", fmt(s["price"]))
-    cols[1].metric("Below EMA", fmt(s["ema_gap_atr"], ".1f", " ATR"))
-    cols[2].metric("Pullback", fmt(s["pullback_atr"], ".1f", " ATR"))
-    cols[3].metric("Bars since spike", fmt(s["bars_since_spike"], ".0f"))
-    percentile = None if s["cycle_percentile"] is None else s["cycle_percentile"] * 100
-    cols[4].metric("Cycle percentile", fmt(percentile, ".0f"))
+def stats_strip(s: dict) -> None:
+    """Bar verdict plus the secondary metrics in one bordered row."""
+    with st.container(border=True):
+        cols = st.columns([2, 1, 1, 1, 1, 1])
+        with cols[0]:
+            verdict_card(s)
+        cols[1].metric("Price", fmt(s["price"]))
+        cols[2].metric("Below EMA", fmt(s["ema_gap_atr"], ".1f", " ATR"))
+        cols[3].metric("Pullback", fmt(s["pullback_atr"], ".1f", " ATR"))
+        cols[4].metric("Bars since spike", fmt(s["bars_since_spike"], ".0f"))
+        percentile = None if s["cycle_percentile"] is None else s["cycle_percentile"] * 100
+        cols[5].metric("Cycle percentile", fmt(percentile, ".0f"))
 
 
 def checklist_panel(snapshot: dict) -> None:
-    st.subheader("Technical checklist")
+    st.markdown("**Technical checklist**")
     for item in snapshot["checklist"]:
         icon = "✅" if item["passed"] else ("🟡" if item["score"] >= 0.5 else "⬜")
-        st.markdown(f"{icon} **{item['label']}**  \n{item['detail']}")
-        st.progress(min(max(item["score"], 0.0), 1.0))
+        st.progress(min(max(item["score"], 0.0), 1.0), text=f"{icon} {item['label']} · {item['detail']}")
 
 
 def x_values(bars: me.Bars) -> np.ndarray:
@@ -798,7 +847,7 @@ def price_chart(bars: me.Bars, a: me.Analysis, window: int) -> go.Figure:
             marker=dict(symbol="triangle-up", size=11, color=AQUA, line=dict(color=SURFACE, width=2)),
         )
     )
-    return base_layout(fig, 460, "Price")
+    return base_layout(fig, 380, "Price")
 
 
 def score_chart(bars: me.Bars, a: me.Analysis, window: int) -> go.Figure:
@@ -809,7 +858,7 @@ def score_chart(bars: me.Bars, a: me.Analysis, window: int) -> go.Figure:
         fig.add_hline(y=level, line=dict(color=MUTED, width=1, dash="dash"),
                       annotation_text=label, annotation_position="top left",
                       annotation_font_color=INK)
-    base_layout(fig, 200, "Score")
+    base_layout(fig, 170, "Score")
     fig.update_yaxes(range=[0, 100])
     fig.update_layout(showlegend=False)
     return fig
@@ -968,35 +1017,41 @@ def render(choices: dict) -> None:
         bars.close, bars.high, bars.low, analysis.ema, analysis.pullback_atr, choices["downtrend_lookback"]
     )
 
-    master_panel(cycle, reading, master, source_text, downtrend, exhaustion)
-    st.divider()
-    verdict_card(snapshot, source_text)
-    metric_row(snapshot)
+    # Source badge, then the command center: master score | exhaustion.
+    st.markdown(f'<span class="dash-badge">{html.escape(source_text)}</span>', unsafe_allow_html=True)
+    left, right = st.columns(2)
+    with left:
+        master_card(cycle, reading, master, downtrend)
+    with right:
+        exhaustion_card(exhaustion, downtrend)
+    show_downtrend(downtrend)
+    stats_strip(snapshot)
 
     tab_live, tab_edge, tab_data = st.tabs(["Breakdown", "Edge test", "Data"])
     with tab_live:
         chart_col, check_col = st.columns([3, 1])
-        with chart_col:
+        with chart_col, st.container(border=True):
             st.plotly_chart(price_chart(bars, analysis, choices["window"]),
                             width="stretch", key="price")
             st.plotly_chart(score_chart(bars, analysis, choices["window"]),
                             width="stretch", key="score")
-        with check_col:
+        with check_col, st.container(border=True):
             checklist_panel(snapshot)
             st.caption(
                 f"{len(bars):,} bars loaded · {snapshot['spike_count']} spikes detected · "
                 "newest bar may still be forming"
             )
-    with tab_edge:
+    with tab_edge, st.container(border=True):
         edge_panel(bars, analysis, choices["horizon"], choices["ema_extreme_pct"])
-    with tab_data:
+    with tab_data, st.container(border=True):
         data_table(bars, analysis)
 
 
 def main() -> None:
     st.set_page_config(page_title="Boom 1000 Analyzer", page_icon="📈", layout="wide")
     init_tick_state()
-    st.title("Boom 1000 Analyzer")
+    st.markdown(DASHBOARD_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="dash-head"><h1>📈 Boom 1000 Analyzer</h1></div>', unsafe_allow_html=True)
     choices = sidebar_controls()
     interval = choices["refresh"] if choices.get("auto") else None
 

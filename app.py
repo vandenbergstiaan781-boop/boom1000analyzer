@@ -48,6 +48,23 @@ DENSITY_WINDOW_TICKS = 10
 PROBABILITY_FLOOR, PROBABILITY_CEILING = 5.0, 95.0
 ACTION_ZONE, BUILDING_ZONE = 85.0, 60.0
 
+# Extended down-trend detector: looks back over past bars, not just the latest one.
+DOWNTREND_LOOKBACK_DEFAULT = 40     # bars inspected
+DOWNTREND_MIN_CYCLE_DEFAULT = 1000  # ticks since the last spike that count as a long wait
+DOWNTREND_BELOW_EMA_SHARE = 0.80    # share of window closes below the 20 EMA
+DOWNTREND_DOWN_SHARE = 0.60         # share of window bars that closed lower
+DOWNTREND_LOWER_LOW_SHARE = 0.50    # share of window bars that made a lower low
+DOWNTREND_MIN_STREAK = 5            # longest run of consecutive down closes
+
+# Down-trend exhaustion score: max points per factor and its zones.
+EXHAUSTION_POINTS = {"deceleration": 35.0, "shrinking": 30.0, "convergence": 20.0, "stretch": 15.0}
+EXHAUSTION_FULL_SHRINK = 0.50       # candles 50% smaller than earlier in the window = full marks
+EXHAUSTION_ZONE, SLOWING_ZONE = 75.0, 50.0
+
+# Score context tags (master score ranges, in %).
+TRAP_RANGE = (80.0, 100.0)          # with an active down-trend
+CLEAN_RANGE = (60.0, 68.0)          # with no down-trend
+
 
 # ---------------------------------------------------------------------------
 # Tick counter and master engine (plain functions, no UI, easy to test)
@@ -123,6 +140,157 @@ def master_probability(
             "density": 100.0 * WEIGHT_DENSITY * density,
         },
     }
+
+
+def longest_down_streak(close: np.ndarray) -> int:
+    """Longest run of consecutive lower closes."""
+    best = run = 0
+    for falling in np.diff(close) < 0:
+        run = run + 1 if falling else 0
+        best = max(best, run)
+    return best
+
+
+def extended_downtrend(
+    close,
+    low,
+    ema_line,
+    spikes,
+    cycle_ticks: float,
+    lookback: int = DOWNTREND_LOOKBACK_DEFAULT,
+    min_cycle_ticks: float = DOWNTREND_MIN_CYCLE_DEFAULT,
+) -> dict:
+    """Check the last `lookback` bars for a sustained, spike-free bleed.
+
+    Detected when ALL of these hold:
+      - the cycle is long (cycle_ticks >= min_cycle_ticks)
+      - no spike inside the window, so there was no valid reset
+      - price ended the window lower than it started
+      - at least 80% of window closes sat below the 20 EMA
+    AND at least 2 of these 3 trend patterns show:
+      - 60%+ of bars closed lower
+      - 50%+ of bars made a lower low than the bar before
+      - a run of 5+ consecutive down closes
+    """
+    close, low = np.asarray(close, float), np.asarray(low, float)
+    ema_line, spikes = np.asarray(ema_line, float), np.asarray(spikes, bool)
+    result = {"detected": False, "ready": False, "lookback": lookback, "checks": []}
+    if len(close) < lookback + 1:
+        return result
+
+    window = slice(len(close) - lookback, None)
+    c, l, e = close[window], low[window], ema_line[window]
+    if not np.isfinite(e).all():
+        return result  # EMA still warming up
+    result["ready"] = True
+
+    below_ema = float((c < e).mean())
+    down_share = float((np.diff(close[-(lookback + 1):]) < 0).mean())
+    lower_lows = float((np.diff(low[-(lookback + 1):]) < 0).mean())
+    streak = longest_down_streak(close[-(lookback + 1):])
+    net_move = float(c[-1] - close[-(lookback + 1)])
+    long_cycle = bool(np.isfinite(cycle_ticks) and cycle_ticks >= min_cycle_ticks)
+    no_spike = not bool(spikes[window].any())
+
+    required = [
+        ("Long cycle", long_cycle,
+         "n/a" if not np.isfinite(cycle_ticks) else f"{cycle_ticks:,.0f} ticks", f">= {min_cycle_ticks:,.0f} ticks"),
+        ("No spike reset in window", no_spike,
+         f"{int(spikes[window].sum())} spikes", "0 spikes"),
+        ("Net drop over window", net_move < 0, f"{net_move:+,.2f} pts", "below 0"),
+        ("Closes below 20 EMA", below_ema >= DOWNTREND_BELOW_EMA_SHARE,
+         f"{below_ema:.0%}", f">= {DOWNTREND_BELOW_EMA_SHARE:.0%}"),
+    ]
+    patterns = [
+        ("Down closes", down_share >= DOWNTREND_DOWN_SHARE, f"{down_share:.0%}", f">= {DOWNTREND_DOWN_SHARE:.0%}"),
+        ("Lower lows", lower_lows >= DOWNTREND_LOWER_LOW_SHARE, f"{lower_lows:.0%}", f">= {DOWNTREND_LOWER_LOW_SHARE:.0%}"),
+        ("Down streak", streak >= DOWNTREND_MIN_STREAK, f"{streak} bars", f">= {DOWNTREND_MIN_STREAK} bars"),
+    ]
+    pattern_hits = sum(passed for _, passed, _, _ in patterns)
+    result["detected"] = all(passed for _, passed, _, _ in required) and pattern_hits >= 2
+    result["pattern_hits"] = pattern_hits
+    result["checks"] = [
+        {"Check": name, "Group": group, "Reading": reading, "Needs": needs, "Passed": "✅" if passed else "⬜"}
+        for group, items in (("Required", required), ("2 of 3", patterns))
+        for name, passed, reading, needs in items
+    ]
+    return result
+
+
+def downtrend_exhaustion(close, high, low, ema_line, pullback_atr, lookback: int = DOWNTREND_LOOKBACK_DEFAULT) -> dict:
+    """0-100 score for how worn out the recent down-trend looks, from past and current bars.
+
+    The lookback window is split into an earlier and a later half and compared:
+      - Grind deceleration (35): price falls more slowly in the later half.
+      - Shrinking candles (30): later candles are smaller (full marks at 50% smaller).
+      - EMA convergence (20): the gap below the 20 EMA has closed from its widest
+        point in the window (full marks once price is back at or above the EMA).
+      - Historical stretch (15): the current pullback ranks high against every
+        earlier pullback in the loaded history.
+    Uses only past and current data. It is a weighted score, not a measured chance.
+    """
+    close, high, low = np.asarray(close, float), np.asarray(high, float), np.asarray(low, float)
+    ema_line, pullback_atr = np.asarray(ema_line, float), np.asarray(pullback_atr, float)
+    empty = {"ready": False, "score": 0.0, "points": {k: 0.0 for k in EXHAUSTION_POINTS}, "readings": {}}
+    half = lookback // 2
+    if len(close) < lookback + 1 or half < 2:
+        return empty
+
+    window = slice(len(close) - lookback, None)
+    if not np.isfinite(ema_line[window]).all():
+        return empty
+
+    # Candle size per bar: true range, so tick data (high == low) still has a size.
+    prev_close = close[-(lookback + 1):-1]
+    size = np.maximum(high[window] - low[window], np.abs(close[window] - prev_close))
+    path = close[-(lookback + 1):]
+    early_drop = (path[0] - path[half]) / half                 # points lost per bar, earlier half
+    late_drop = (path[half] - path[-1]) / (lookback - half)    # points lost per bar, later half
+
+    deceleration = float(np.clip(1.0 - late_drop / early_drop, 0.0, 1.0)) if early_drop > 0 else 0.0
+    early_size, late_size = size[:half].mean(), size[half:].mean()
+    shrink = float(1.0 - late_size / early_size) if early_size > 0 else 0.0
+    shrinking = float(np.clip(shrink / EXHAUSTION_FULL_SHRINK, 0.0, 1.0))
+
+    gap = ema_line[window] - close[window]                     # positive = below the EMA
+    widest = gap.max()
+    convergence = float(np.clip(1.0 - max(gap[-1], 0.0) / widest, 0.0, 1.0)) if widest > 0 else 0.0
+
+    current, past = pullback_atr[-1], pullback_atr[:-1]
+    past = past[np.isfinite(past)]
+    stretch = float((past <= current).mean()) if np.isfinite(current) and len(past) else 0.0
+
+    parts = {"deceleration": deceleration, "shrinking": shrinking, "convergence": convergence, "stretch": stretch}
+    points = {k: EXHAUSTION_POINTS[k] * v for k, v in parts.items()}
+    return {
+        "ready": True,
+        "score": float(sum(points.values())),
+        "points": points,
+        "readings": {
+            "deceleration": f"{early_drop:,.3f} -> {late_drop:,.3f} pts/bar",
+            "shrinking": f"{shrink:+.0%} smaller",
+            "convergence": f"gap {max(gap[-1], 0.0):,.2f} of widest {widest:,.2f} pts",
+            "stretch": f"{stretch:.0%} of past pullbacks",
+        },
+    }
+
+
+def exhaustion_status(score: float) -> str:
+    """Status label for the exhaustion bar."""
+    if score >= EXHAUSTION_ZONE:
+        return "Exhaustion Zone — Down-Trend Likely Ending"
+    if score >= SLOWING_ZONE:
+        return "Momentum Slowing — Watch for Stabilization"
+    return "Trend Still Strong — Do Not Buy"
+
+
+def score_context_tag(downtrend_detected: bool, probability: float) -> str | None:
+    """'trap', 'clean' or None, from the down-trend flag and the master score."""
+    if downtrend_detected and TRAP_RANGE[0] <= probability <= TRAP_RANGE[1]:
+        return "trap"
+    if not downtrend_detected and CLEAN_RANGE[0] <= probability <= CLEAN_RANGE[1]:
+        return "clean"
+    return None
 
 
 def alert_level(probability: float) -> str:
@@ -224,6 +392,16 @@ def sidebar_controls() -> dict:
             choices["ema_extreme_pct"] = st.slider(
                 "EMA deviation for full marks (%)", 0.01, 10.0, EMA_EXTREME_PCT_DEFAULT, 0.01,
                 help="How far below the EMA, in percent of price, earns the full 20% weight.",
+            )
+
+        with st.expander("Extended down-trend"):
+            choices["downtrend_lookback"] = st.slider(
+                "Lookback (bars)", 20, 100, DOWNTREND_LOOKBACK_DEFAULT, 5,
+                help="How many past bars are checked for a sustained bleed.",
+            )
+            choices["downtrend_min_cycle"] = st.slider(
+                "Long cycle from (ticks)", 300, 5000, DOWNTREND_MIN_CYCLE_DEFAULT, 100,
+                help="Cycle age that counts as a long wait.",
             )
 
         st.header("Indicators")
@@ -420,12 +598,67 @@ def show_alert(probability: float) -> None:
         st.info(f"WAITING: master score {probability:.1f}% (under 60%)", icon="ℹ️")
 
 
-def master_panel(cycle: dict, reading: dict, master: dict, source_text: str) -> None:
-    """Alert banner, cycle and probability cards, tension bar and factor breakdown."""
+def show_downtrend(downtrend: dict) -> None:
+    """Red warning when past bars confirm a prolonged grind, plus the checks behind it."""
+    if downtrend["detected"]:
+        st.error(
+            "**⚠️ EXTENDED DOWN-TREND DETECTED**\n\n"
+            "Past and current data show a prolonged downward grind. "
+            "Do not assume a spike is due just because the wait is long."
+        )
+    if downtrend["checks"]:
+        label = "Extended down-trend checks" + (" (detected)" if downtrend["detected"] else "")
+        with st.expander(f"{label}: last {downtrend['lookback']} bars"):
+            st.dataframe(downtrend["checks"], width="stretch", hide_index=True)
+            st.caption("Detected when every Required check passes and at least 2 of the 3 trend patterns show.")
+
+
+def show_exhaustion(exhaustion: dict, downtrend: dict, probability: float) -> None:
+    """Exhaustion bar and score context tag, shown below the down-trend banner."""
+    tag = score_context_tag(downtrend["detected"], probability)
+    if tag == "trap":
+        st.error("⚠️ High-Risk Grind Trap — Avoid")
+    elif tag == "clean":
+        st.success("✅ Clean Setup Zone — No Heavy Down-Trend")
+
+    if not exhaustion["ready"]:
+        st.caption("Down-Trend Exhaustion: waiting for enough bars and a warm 20 EMA.")
+        return
+    score = exhaustion["score"]
+    icon = "🟢" if score >= EXHAUSTION_ZONE else ("🟡" if score >= SLOWING_ZONE else "🔴")
+    st.progress(
+        min(max(int(round(score)), 0), 100),
+        text=f"Down-Trend Exhaustion: {score:.0f}% · {icon} {exhaustion_status(score)}",
+    )
+    with st.expander("How the exhaustion score was built"):
+        names = {
+            "deceleration": "Grind deceleration",
+            "shrinking": "Shrinking candles",
+            "convergence": "EMA convergence",
+            "stretch": "Historical stretch",
+        }
+        st.dataframe(
+            [
+                {"Factor": names[k], "Reading": exhaustion["readings"][k],
+                 "Points": f"{exhaustion['points'][k]:.1f} / {EXHAUSTION_POINTS[k]:.0f}"}
+                for k in EXHAUSTION_POINTS
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption("Compares the earlier and later half of the down-trend lookback. Weighted score, not a measured chance.")
+
+
+def master_panel(
+    cycle: dict, reading: dict, master: dict, source_text: str, downtrend: dict, exhaustion: dict
+) -> None:
+    """Alert banners, cycle and probability cards, tension bar and factor breakdown."""
     st.caption(source_text)
     probability = float(master["probability"])
     tension = float(master["tension"])
     show_alert(probability)
+    show_downtrend(downtrend)
+    show_exhaustion(exhaustion, downtrend, probability)
 
     has_age = np.isfinite(cycle["ticks"])
     suffix = "" if cycle["known"] else "+"  # no spike seen yet, so the true age is at least this
@@ -726,7 +959,16 @@ def render(choices: dict) -> None:
         "ema_extreme": f"{choices['ema_extreme_pct']:g}% below",
     }
 
-    master_panel(cycle, reading, master, source_text)
+    downtrend = extended_downtrend(
+        bars.close, bars.low, analysis.ema, analysis.spikes, cycle["ticks"],
+        choices["downtrend_lookback"], choices["downtrend_min_cycle"],
+    )
+
+    exhaustion = downtrend_exhaustion(
+        bars.close, bars.high, bars.low, analysis.ema, analysis.pullback_atr, choices["downtrend_lookback"]
+    )
+
+    master_panel(cycle, reading, master, source_text, downtrend, exhaustion)
     st.divider()
     verdict_card(snapshot, source_text)
     metric_row(snapshot)

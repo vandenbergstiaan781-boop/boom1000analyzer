@@ -7,6 +7,7 @@ maths lives in math_engine.py and data loading lives in data_feed.py.
 from __future__ import annotations
 
 import html
+from pathlib import Path
 from dataclasses import replace
 
 import numpy as np
@@ -27,6 +28,9 @@ VERDICT_STYLE = {
     me.WATCH: ("👀", "#fab219"),
     me.WAIT: ("⏳", MUTED),
 }
+
+# Logo: the full SpikeVision poster.
+LOGO = Path(__file__).with_name("assets") / "logo.jpg"
 
 # Compact dashboard styling: tighter spacing, smaller metric text, card headers.
 DASHBOARD_CSS = """
@@ -78,6 +82,11 @@ EXHAUSTION_ZONE, SLOWING_ZONE = 75.0, 50.0
 # Score context tags (master score ranges, in %).
 TRAP_RANGE = (80.0, 100.0)          # with an active down-trend
 CLEAN_RANGE = (60.0, 68.0)          # with no down-trend
+
+# Unified Spike Probability: weights (out of 100) and the down-trend discount.
+UNIFIED_WEIGHTS = {"ema": 30.0, "pullback": 30.0, "cycle": 25.0, "exhaustion": 15.0}
+UNIFIED_MIN_MULTIPLIER = 0.50       # active down-trend with 0% exhaustion halves the score
+UNIFIED_STRONG, UNIFIED_BUILDING = 75.0, 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +314,65 @@ def score_context_tag(downtrend_detected: bool, probability: float) -> str | Non
     if not downtrend_detected and CLEAN_RANGE[0] <= probability <= CLEAN_RANGE[1]:
         return "clean"
     return None
+
+
+def unified_spike_probability(
+    ema_gap_atr,
+    pullback_atr,
+    cycle_ticks,
+    exhaustion_score: float,
+    downtrend_detected: bool,
+    ema_target_atr: float,
+    pullback_target_atr: float,
+) -> dict:
+    """One 0-100 reading from the existing indicators.
+
+    Base score (each factor scaled 0-1 and capped at 1, missing values count as 0):
+      - EMA distance (30):  ATRs below the 20 EMA / the bar score EMA gap target (8 ATR)
+      - Pullback (30):      ATRs below the swing high / the bar score pullback target (25 ATR)
+      - Cycle age (25):     ticks since the last spike / 1,000 ticks
+      - Exhaustion (15):    Down-Trend Exhaustion score / 100
+    Down-trend discount: when the extended down-trend warning is active, the base score is
+    multiplied by 0.50 at 0% exhaustion, rising in a straight line to 1.00 (no discount)
+    once exhaustion reaches 75%. With no active down-trend, the multiplier is 1.00.
+    It is a weighted score, not a measured chance.
+    """
+
+    def scaled(value, target):
+        value = float(value) if value is not None else float("nan")
+        return float(np.clip(np.nan_to_num(value / target, nan=0.0), 0.0, 1.0)) if target > 0 else 0.0
+
+    exhaustion_score = float(np.nan_to_num(exhaustion_score, nan=0.0))
+    parts = {
+        "ema": scaled(ema_gap_atr, ema_target_atr),
+        "pullback": scaled(pullback_atr, pullback_target_atr),
+        "cycle": scaled(cycle_ticks, CYCLE_BASELINE_TICKS),
+        "exhaustion": float(np.clip(exhaustion_score / 100.0, 0.0, 1.0)),
+    }
+    points = {k: UNIFIED_WEIGHTS[k] * v for k, v in parts.items()}
+    base = sum(points.values())
+
+    if downtrend_detected:
+        eased = float(np.clip(exhaustion_score / EXHAUSTION_ZONE, 0.0, 1.0))
+        multiplier = UNIFIED_MIN_MULTIPLIER + (1.0 - UNIFIED_MIN_MULTIPLIER) * eased
+    else:
+        multiplier = 1.0
+
+    return {
+        "score": float(np.clip(base * multiplier, 0.0, 100.0)),
+        "base": float(base),
+        "multiplier": float(multiplier),
+        "points": points,
+    }
+
+
+def unified_status(score: float) -> str:
+    """Status label for the unified bar."""
+    if score >= UNIFIED_STRONG:
+        return "Strong Confluence — Indicators Aligned"
+    if score >= UNIFIED_BUILDING:
+        return "Building — Partial Alignment"
+    return "Weak — Wait"
 
 
 def alert_level(probability: float) -> str:
@@ -696,6 +764,34 @@ def exhaustion_card(exhaustion: dict, downtrend: dict) -> None:
         downtrend_checks(downtrend)
 
 
+def unified_card(unified: dict, readings: dict) -> None:
+    """Full-width Unified Spike Probability bar under the command center."""
+    score = unified["score"]
+    icon = "🟢" if score >= UNIFIED_STRONG else ("🟡" if score >= UNIFIED_BUILDING else "🔴")
+    with st.container(border=True):
+        number_col, bar_col = st.columns([1, 3], vertical_alignment="top")
+        with number_col:
+            big_number("Unified Spike Probability", f"{score:.0f}%")
+        with bar_col:
+            discount = (
+                f" · down-trend discount ×{unified['multiplier']:.2f}" if unified["multiplier"] < 1.0 else ""
+            )
+            st.progress(min(max(int(round(score)), 0), 100),
+                        text=f"{icon} {unified_status(score)}{discount}")
+            with st.expander("How the unified score was built"):
+                names = {"ema": "Below 20 EMA", "pullback": "Pullback from swing high",
+                         "cycle": "Cycle age", "exhaustion": "Down-trend exhaustion"}
+                rows = [
+                    {"Factor": names[k], "Reading": readings[k],
+                     "Points": f"{unified['points'][k]:.1f} / {UNIFIED_WEIGHTS[k]:.0f}"}
+                    for k in UNIFIED_WEIGHTS
+                ]
+                rows.append({"Factor": "Down-trend discount", "Reading": "active" if unified["multiplier"] < 1.0 else "none",
+                             "Points": f"×{unified['multiplier']:.2f} on {unified['base']:.1f}"})
+                st.dataframe(rows, width="stretch", hide_index=True)
+                st.caption("Weighted score, not a measured chance of a spike.")
+
+
 def cycle_texts(cycle: dict) -> tuple[str, str]:
     """Cycle age as (ticks, seconds) text, with ~ for estimates and + for 'at least'."""
     if not np.isfinite(cycle["ticks"]):
@@ -1024,6 +1120,23 @@ def render(choices: dict) -> None:
         master_card(cycle, reading, master, downtrend)
     with right:
         exhaustion_card(exhaustion, downtrend)
+
+    # Unified Spike Probability: combines the existing readings into one bar.
+    p = analysis.params
+    unified = unified_spike_probability(
+        snapshot["ema_gap_atr"], snapshot["pullback_atr"], cycle["ticks"],
+        exhaustion["score"] if exhaustion["ready"] else 0.0, downtrend["detected"],
+        p.ema_gap_target_atr, p.pullback_target_atr,
+    )
+    unified_card(
+        unified,
+        {
+            "ema": fmt(snapshot["ema_gap_atr"], ".1f", f" ATR (target {p.ema_gap_target_atr:g})"),
+            "pullback": fmt(snapshot["pullback_atr"], ".1f", f" ATR (target {p.pullback_target_atr:g})"),
+            "cycle": cycle_texts(cycle)[0] + " ticks (target 1,000)",
+            "exhaustion": f"{exhaustion['score']:.0f}%" if exhaustion["ready"] else "n/a",
+        },
+    )
     show_downtrend(downtrend)
     stats_strip(snapshot)
 
@@ -1048,10 +1161,17 @@ def render(choices: dict) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Boom 1000 Analyzer", page_icon="📈", layout="wide")
+    has_logo = LOGO.exists()
+    st.set_page_config(
+        page_title="Boom 1000 SpikeVision Analyzer",
+        page_icon=str(LOGO) if has_logo else "📈",
+        layout="wide",
+    )
     init_tick_state()
     st.markdown(DASHBOARD_CSS, unsafe_allow_html=True)
-    st.markdown('<div class="dash-head"><h1>📈 Boom 1000 Analyzer</h1></div>', unsafe_allow_html=True)
+    st.markdown('<div class="dash-head"><h1>Boom 1000 SpikeVision Analyzer</h1></div>', unsafe_allow_html=True)
+    if has_logo:
+        st.sidebar.image(str(LOGO), width="stretch")  # full poster at the top of the sidebar
     choices = sidebar_controls()
     interval = choices["refresh"] if choices.get("auto") else None
 

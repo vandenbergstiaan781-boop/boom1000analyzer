@@ -18,13 +18,17 @@ import data_feed
 import math_engine as me
 
 # Chart colours (dark theme, set in .streamlit/config.toml).
-BLUE, ORANGE, AQUA = "#3987e5", "#d95926", "#199e70"
-INK, MUTED, GRID, AXIS = "#c3c2b7", "#898781", "#2c2c2a", "#383835"
-SURFACE = "#1a1a19"
+# Brand palette: deep black, metallic slate cards, silver-white text, neon green, sharp red.
+BG, CARD, BORDER, TEXT = "#080B09", "#111714", "#2A332E", "#F0F4F2"
+NEON, RED = "#00FF41", "#FF2A2A"
+# Chart roles mapped to the brand (names kept so the chart code is unchanged).
+BLUE, ORANGE, AQUA = NEON, TEXT, NEON      # up candles / score line, EMA line, spike markers
+INK, MUTED, GRID, AXIS = "#C9D1CD", "#8A958F", "#1C2420", BORDER
+SURFACE = CARD
 
 # Verdict display: an icon and label always go with the colour.
 VERDICT_STYLE = {
-    me.HIGH: ("✅", "#0ca30c"),
+    me.HIGH: ("✅", NEON),
     me.WATCH: ("👀", "#fab219"),
     me.WAIT: ("⏳", MUTED),
 }
@@ -33,16 +37,63 @@ VERDICT_STYLE = {
 LOGO = Path(__file__).with_name("assets") / "logo.jpg"
 
 # Compact dashboard styling: tighter spacing, smaller metric text, card headers.
-DASHBOARD_CSS = """
+DASHBOARD_CSS = f"""
 <style>
-.block-container {padding-top: 2.6rem; padding-bottom: 1rem;}
-[data-testid="stMetricValue"] {font-size: 1.3rem;}
-[data-testid="stMetricLabel"] p {font-size: 0.78rem; color: #898781;}
-.dash-head {display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 0.2rem;}
-.dash-head h1 {font-size: 1.6rem; margin: 0; padding: 0;}
-.dash-pill {display: inline-block; font-size: 0.8rem; font-weight: 600; padding: 3px 10px;
-            border-radius: 999px; margin-left: 10px; vertical-align: middle;}
-.dash-badge {font-size: 0.78rem; color: #898781; border: 1px solid #383835; border-radius: 999px; padding: 2px 10px;}
+/* Layout spacing */
+.block-container {{padding-top: 2.6rem; padding-bottom: 1rem;}}
+.dash-head {{display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 0.2rem;}}
+.dash-head h1 {{font-size: 1.6rem; margin: 0; padding: 0; color: {TEXT}; letter-spacing: 0.01em;}}
+.dash-pill {{display: inline-block; font-size: 0.8rem; font-weight: 600; padding: 3px 10px;
+            border-radius: 999px; margin-left: 10px; vertical-align: middle;}}
+.dash-badge {{font-size: 0.78rem; color: {MUTED}; border: 1px solid {BORDER}; border-radius: 999px;
+             padding: 2px 10px; background: {CARD};}}
+
+/* Page and sidebar */
+.stApp, [data-testid="stHeader"] {{background: {BG};}}
+[data-testid="stSidebar"] {{background: linear-gradient(180deg, #0D120F 0%, {BG} 100%);
+                           border-right: 1px solid {BORDER};}}
+
+/* Cards: metallic slate with a faint top sheen */
+[class*="st-key-card-"] {{
+    background: linear-gradient(180deg, #151C18 0%, {CARD} 60%);
+    border: 1px solid {BORDER} !important;
+    border-radius: 10px;
+    box-shadow: inset 0 1px 0 rgba(240, 244, 242, 0.04), 0 2px 12px rgba(0, 0, 0, 0.45);
+}}
+
+/* Metrics */
+[data-testid="stMetricValue"] {{font-size: 1.3rem; color: {TEXT}; font-variant-numeric: tabular-nums;}}
+[data-testid="stMetricLabel"] p {{font-size: 0.78rem; color: {MUTED}; letter-spacing: 0.02em;}}
+
+/* Progress bars: neon green fill with a soft glow on a dark track */
+[data-testid="stProgressBarTrack"] {{background: #1A221E; border-radius: 999px; height: 8px;}}
+[data-testid="stProgressBarTrack"] > div {{background: {NEON}; border-radius: 999px;
+                                          box-shadow: 0 0 8px rgba(0, 255, 65, 0.55);}}
+[data-testid="stProgress"] p {{color: {TEXT};}}
+
+/* Alerts: dark fill, coloured edge */
+[data-testid="stAlertContainer"] {{border-radius: 8px; border: 1px solid {BORDER};}}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) {{
+    background: rgba(255, 42, 42, 0.10); border-color: rgba(255, 42, 42, 0.55);
+    border-left: 4px solid {RED}; box-shadow: 0 0 14px rgba(255, 42, 42, 0.18);
+}}
+[data-testid="stAlertContentError"], [data-testid="stAlertContentError"] p {{color: #FF6B6B;}}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) {{
+    background: rgba(0, 255, 65, 0.08); border-color: rgba(0, 255, 65, 0.45);
+    border-left: 4px solid {NEON}; box-shadow: 0 0 14px rgba(0, 255, 65, 0.15);
+}}
+[data-testid="stAlertContentSuccess"], [data-testid="stAlertContentSuccess"] p {{color: {NEON};}}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) {{
+    background: rgba(250, 178, 25, 0.08); border-left: 4px solid #fab219;
+}}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) {{
+    background: rgba(240, 244, 242, 0.04); border-left: 4px solid {MUTED};
+}}
+[data-testid="stAlertContentInfo"], [data-testid="stAlertContentInfo"] p {{color: {INK};}}
+
+/* Expanders and tabs */
+[data-testid="stExpander"] details {{background: {BG}; border: 1px solid {BORDER}; border-radius: 8px;}}
+[data-testid="stTab"][aria-selected="true"] p {{color: {NEON}; text-shadow: 0 0 8px rgba(0, 255, 65, 0.4);}}
 </style>
 """
 
@@ -726,13 +777,13 @@ def big_number(kicker: str, value: str, pill: str = "", colour: str = MUTED) -> 
 
 def exhaustion_colour(score: float) -> str:
     if score >= EXHAUSTION_ZONE:
-        return "#0ca30c"
-    return "#fab219" if score >= SLOWING_ZONE else "#e5484d"
+        return NEON
+    return "#fab219" if score >= SLOWING_ZONE else RED
 
 
 def exhaustion_card(exhaustion: dict, downtrend: dict) -> None:
     """Command center, right column: exhaustion bar, percentage and status."""
-    with st.container(border=True):
+    with st.container(border=True, key="card-master"):
         if not exhaustion["ready"]:
             big_number("Down-Trend Exhaustion", "n/a")
             st.caption("Waiting for enough bars and a warm 20 EMA.")
@@ -768,7 +819,7 @@ def unified_card(unified: dict, readings: dict) -> None:
     """Full-width Unified Spike Probability bar under the command center."""
     score = unified["score"]
     icon = "🟢" if score >= UNIFIED_STRONG else ("🟡" if score >= UNIFIED_BUILDING else "🔴")
-    with st.container(border=True):
+    with st.container(border=True, key="card-exhaustion"):
         number_col, bar_col = st.columns([1, 3], vertical_alignment="top")
         with number_col:
             big_number("Unified Spike Probability", f"{score:.0f}%")
@@ -810,7 +861,7 @@ def master_card(cycle: dict, reading: dict, master: dict, downtrend: dict) -> No
     tension = float(master["tension"])
     ticks_text, seconds_text = cycle_texts(cycle)
 
-    with st.container(border=True):
+    with st.container(border=True, key="card-unified"):
         big_number("Master Spike Probability", f"{probability:.1f}%")
         show_alert(probability)
         show_context_tag(downtrend["detected"], probability)
@@ -872,7 +923,7 @@ def fmt(value, spec: str = ",.2f", suffix: str = "") -> str:
 
 def stats_strip(s: dict) -> None:
     """Bar verdict plus the secondary metrics in one bordered row."""
-    with st.container(border=True):
+    with st.container(border=True, key="card-stats"):
         cols = st.columns([2, 1, 1, 1, 1, 1])
         with cols[0]:
             verdict_card(s)
@@ -1143,20 +1194,20 @@ def render(choices: dict) -> None:
     tab_live, tab_edge, tab_data = st.tabs(["Breakdown", "Edge test", "Data"])
     with tab_live:
         chart_col, check_col = st.columns([3, 1])
-        with chart_col, st.container(border=True):
+        with chart_col, st.container(border=True, key="card-charts"):
             st.plotly_chart(price_chart(bars, analysis, choices["window"]),
                             width="stretch", key="price")
             st.plotly_chart(score_chart(bars, analysis, choices["window"]),
                             width="stretch", key="score")
-        with check_col, st.container(border=True):
+        with check_col, st.container(border=True, key="card-checklist"):
             checklist_panel(snapshot)
             st.caption(
                 f"{len(bars):,} bars loaded · {snapshot['spike_count']} spikes detected · "
                 "newest bar may still be forming"
             )
-    with tab_edge, st.container(border=True):
+    with tab_edge, st.container(border=True, key="card-edge"):
         edge_panel(bars, analysis, choices["horizon"], choices["ema_extreme_pct"])
-    with tab_data, st.container(border=True):
+    with tab_data, st.container(border=True, key="card-data"):
         data_table(bars, analysis)
 
 
